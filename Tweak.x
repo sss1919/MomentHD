@@ -1,145 +1,190 @@
 //
-//  Tweak.x
-//  高清朋友圈(独立精简版)
-//
-//  参照 wchook(悬浮按钮分屏)逆向得出的"高清朋友圈"功能点独立重写,
-//  只保留这一项功能,不依赖原插件的任何 UI/配置框架。
-//
-//  核心思路(逆向自原 dylib 的符号):
-//    1) hook 微信 `adjustSizeToStandardForMoments` —— 朋友圈图片"标准化/压缩"入口,
-//       跳过它即保留原图。
-//    2) hook `shouldCompressLongImage` —— 长图是否压缩,强制否。
-//    3) hook `setSkipVideoCompress:` —— 视频跳过压缩,强制是。
-//    4) hook `isVideoShouldExportWithoutCompressByAsset:scene:` —— 视频导出不压缩,强制是。
-//
-//  为了不硬编码类名(跨版本微信兼容),采用"运行时遍历所有类,
-//  对自身实现了目标 selector 的类逐个 hook",并为每个被 hook 的类
-//  独立保存 orig IMP,避免多类共享 orig 导致崩溃。
+//  Tweak.x — MomentHD
+//  高清朋友圈图片/视频 — 适配微信 8.0.70 (RootHide/Relaxin Rootless)
 //
 
 #import <UIKit/UIKit.h>
-#import <Foundation/Foundation.h>
-#import <objc/runtime.h>
-#import <objc/message.h>
-#import <substrate.h>
 
-// ---- 开关(默认开启) ----
-// 用 NSUserDefaults 控制是否启用。键名沿用习惯。
-static NSString *const kHDKey = @"com.ylr.hdmoments.enabled";
+// ============================ 前向声明 ============================
+@class WCMomentPublishViewController, WCMomentImageUploadHelper, WCMomentVideoCompressHelper;
 
-static BOOL HDOn(void) {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    if (![d objectForKey:kHDKey]) return YES; // 默认开启
-    return [d boolForKey:kHDKey];
+// ============================ 接口声明 ============================
+// 告知编译器继承关系 + %new 方法签名，避免 forward declaration 编译错误
+
+@interface WCMomentPublishViewController : UIViewController
+- (void)momentHD_setupHDSwitch;
+- (void)momentHD_switchChanged:(UISwitch *)sender;
+@end
+
+@interface WCMomentImageUploadHelper : NSObject
+- (UIImage *)compressImage:(UIImage *)image quality:(CGFloat)quality;
+@end
+
+@interface WCMomentVideoCompressHelper : NSObject
+- (id)compressVideo:(id)inputVideo outputPath:(NSString *)outputPath;
+@end
+
+// ============================ 持久化存储 ============================
+
+static NSString *const kMomentHDKey = @"MomentHD_HDEnabled";
+
+static BOOL MomentHD_IsEnabled(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kMomentHDKey];
 }
 
-// ---- per-class orig IMP 存储(多类安全) ----
-// 每个 selector 一份字典: className -> NSValue(IMP)
-static NSMutableDictionary *gOrigAdj;   // adjustSizeToStandardForMoments
-static NSMutableDictionary *gOrigSCL;    // shouldCompressLongImage
-static NSMutableDictionary *gOrigSVC;    // setSkipVideoCompress:
-static NSMutableDictionary *gOrigIVC;   // isVideoShouldExportWithoutCompressByAsset:scene:
-
-static IMP HDOrig(NSDictionary *dict, id self) {
-    NSValue *v = dict[NSStringFromClass(object_getClass(self))];
-    return v ? [v pointerValue] : NULL;
+static void MomentHD_SetEnabled(BOOL enabled) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setBool:enabled forKey:kMomentHDKey];
+    [defaults synchronize];
 }
 
-// 遍历所有类,对"自身定义了该 selector"的类逐个 hook。
-// 跳过本 tweak 自己的类,避免自引用。
-static void HDHookSelector(SEL sel, IMP newImp, NSMutableDictionary *origDict) {
-    unsigned int n = 0;
-    Class *classes = objc_copyClassList(&n);
-    for (unsigned int i = 0; i < n; i++) {
-        Class c = classes[i];
-        const char *cn = class_getName(c);
-        // 跳过本 tweak 与系统 UI 框架无关类,避免噪音
-        if (strstr(cn, "HDMoments")) continue;
+// ============================ UI：发布页面底部开关 ============================
 
-        if (!class_respondsToSelector(c, sel)) continue;
+%hook WCMomentPublishViewController
 
-        // 只 hook 自己定义了该方法的类(继承的让父类处理),
-        // 防止对大量仅继承的子类重复 hook 造成的开销。
-        Class sc = class_getSuperclass(c);
-        if (sc && class_respondsToSelector(sc, sel)) continue;
+- (void)viewDidLoad {
+    %orig;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self momentHD_setupHDSwitch];
+    });
+}
 
-        IMP orig = NULL;
-        MSHookMessageEx(c, sel, newImp, (void **)&orig);
-        if (orig) {
-            [origDict setObject:[NSValue valueWithPointer:orig]
-                         forKey:NSStringFromClass(c)];
-            NSLog(@"[HDMoments] hooked %@ on %s", NSStringFromSelector(sel), cn);
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    UISwitch *hdSwitch = (UISwitch *)[self.view viewWithTag:19950708];
+    if (hdSwitch) {
+        [hdSwitch setOn:MomentHD_IsEnabled() animated:YES];
+    }
+}
+
+%new
+- (void)momentHD_setupHDSwitch {
+    UIView *rootView = self.view;
+    if (!rootView) return;
+
+    // 防止重复添加
+    if ([rootView viewWithTag:19950707]) return;
+
+    // ---- 容器视图 ----
+    UIView *container = [[UIView alloc] init];
+    container.tag = 19950707;
+    container.backgroundColor = [UIColor colorWithWhite:0.965 alpha:1.0];
+    container.translatesAutoresizingMaskIntoConstraints = NO;
+    [rootView addSubview:container];
+
+    // ---- 文字标签 ----
+    UILabel *label = [[UILabel alloc] init];
+    label.text = @"高清朋友圈图片/视频";
+    label.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightMedium];
+    label.textColor = [UIColor darkTextColor];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:label];
+
+    // ---- 开关 ----
+    UISwitch *hdSwitch = [[UISwitch alloc] init];
+    hdSwitch.tag = 19950708;
+    hdSwitch.on = MomentHD_IsEnabled();
+    hdSwitch.onTintColor = [UIColor colorWithRed:0.20 green:0.60 blue:0.97 alpha:1.0];
+    hdSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    [hdSwitch addTarget:self
+                 action:@selector(momentHD_switchChanged:)
+       forControlEvents:UIControlEventValueChanged];
+    [container addSubview:hdSwitch];
+
+    // ---- 自动布局 ----
+    [NSLayoutConstraint activateConstraints:@[
+        [container.leadingAnchor  constraintEqualToAnchor:rootView.leadingAnchor],
+        [container.trailingAnchor constraintEqualToAnchor:rootView.trailingAnchor],
+        [container.bottomAnchor   constraintEqualToAnchor:rootView.safeAreaLayoutGuide.bottomAnchor],
+        [container.heightAnchor   constraintEqualToConstant:52],
+
+        [label.leadingAnchor  constraintEqualToAnchor:container.leadingAnchor constant:16],
+        [label.centerYAnchor  constraintEqualToAnchor:container.centerYAnchor],
+        [label.trailingAnchor constraintEqualToAnchor:hdSwitch.leadingAnchor constant:-12],
+
+        [hdSwitch.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16],
+        [hdSwitch.centerYAnchor   constraintEqualToAnchor:container.centerYAnchor],
+    ]];
+
+    // 如果有 UITableView，增加底部内边距避免遮挡
+    for (UIView *sub in rootView.subviews) {
+        if ([sub isKindOfClass:[UITableView class]]) {
+            UITableView *tv = (UITableView *)sub;
+            UIEdgeInsets inset = tv.contentInset;
+            inset.bottom += 52;
+            tv.contentInset = inset;
+            break;
         }
     }
-    free(classes);
-}
-
-// =====================================================================
-// 1) 图片:跳过"标准化尺寸"压缩,保留原图
-//    注意:微信该方法的精确签名需 class-dump 确认。
-//    这里按"无参、返回处理结果(对象)"的常见形态实现;
-//    若你的微信版本签名不同(例如带入参 UIImage*),请按真实签名调整
-//    hook 函数的参数与返回类型,否则可能不生效或崩溃。
-// =====================================================================
-static id HD_adjustSizeToStandardForMoments(id self, SEL _cmd) {
-    if (HDOn()) {
-        // 跳过标准化 = 保留原图
-        return self;
+    if ([rootView isKindOfClass:[UITableView class]]) {
+        UITableView *tv = (UITableView *)rootView;
+        UIEdgeInsets inset = tv.contentInset;
+        inset.bottom += 52;
+        tv.contentInset = inset;
     }
-    IMP o = HDOrig(gOrigAdj, self);
-    if (o) return ((id (*)(id, SEL))o)(self, _cmd);
-    return self;
 }
 
-// =====================================================================
-// 2) 长图:不压缩
-// =====================================================================
-static BOOL HD_shouldCompressLongImage(id self, SEL _cmd) {
-    if (HDOn()) return NO;
-    IMP o = HDOrig(gOrigSCL, self);
-    if (o) return ((BOOL (*)(id, SEL))o)(self, _cmd);
-    return NO;
+%new
+- (void)momentHD_switchChanged:(UISwitch *)sender {
+    MomentHD_SetEnabled(sender.on);
 }
 
-// =====================================================================
-// 3) 视频:跳过压缩
-// =====================================================================
-static void HD_setSkipVideoCompress(id self, SEL _cmd, BOOL skip) {
-    if (HDOn()) skip = YES;
-    IMP o = HDOrig(gOrigSVC, self);
-    if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, skip);
+%end
+
+// ============================ 图片压缩 Hook ============================
+
+%hook WCMomentImageUploadHelper
+
+// 开关开启 → 返回原图，跳过压缩
+// 开关关闭 → 调用原始方法
+- (UIImage *)compressImage:(UIImage *)image quality:(CGFloat)quality {
+    if (MomentHD_IsEnabled() && image) {
+        NSLog(@"[MomentHD] 图片跳过压缩，返回原图");
+        return image;
+    }
+    return %orig;
 }
 
-// =====================================================================
-// 4) 视频导出不压缩
-//    微信存在两个变体:…:scene: 与 …:scene:encodeJson:,这里 hook 两参版本。
-//    若需要覆盖 encodeJson 变体,可再加一个 hook(签名末尾多一个 BOOL/NSDictionary)。
-// =====================================================================
-static BOOL HD_isVideoShouldExportWithoutCompress(id self, SEL _cmd, id asset, long scene) {
-    if (HDOn()) return YES;
-    IMP o = HDOrig(gOrigIVC, self);
-    if (o) return ((BOOL (*)(id, SEL, id, long))o)(self, _cmd, asset, scene);
-    return YES;
+%end
+
+// ============================ 视频压缩 Hook ============================
+
+%hook WCMomentVideoCompressHelper
+
+// 开关开启 → 直接复制原视频文件，跳过转码压缩
+// 开关关闭 → 执行原生压缩
+- (id)compressVideo:(id)inputVideo outputPath:(NSString *)outputPath {
+    if (MomentHD_IsEnabled()) {
+        NSString *inputPath = nil;
+        if ([inputVideo isKindOfClass:[NSURL class]]) {
+            inputPath = [(NSURL *)inputVideo path];
+        } else if ([inputVideo isKindOfClass:[NSString class]]) {
+            inputPath = (NSString *)inputVideo;
+        }
+
+        if (inputPath.length > 0 && outputPath.length > 0) {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if ([fm fileExistsAtPath:inputPath]) {
+                if ([fm fileExistsAtPath:outputPath]) {
+                    [fm removeItemAtPath:outputPath error:nil];
+                }
+                NSError *copyError = nil;
+                if ([fm copyItemAtPath:inputPath toPath:outputPath error:&copyError]) {
+                    NSLog(@"[MomentHD] 视频跳过压缩，直接复制: %@", outputPath);
+                    return outputPath;
+                }
+                NSLog(@"[MomentHD] 视频复制失败，回退原生压缩: %@",
+                      copyError.localizedDescription);
+            }
+        }
+    }
+    return %orig;
 }
 
-// ---- 入口 ----
+%end
+
+// ============================ 构造函数 ============================
+
 %ctor {
-    @autoreleasepool {
-        gOrigAdj = [NSMutableDictionary dictionary];
-        gOrigSCL = [NSMutableDictionary dictionary];
-        gOrigSVC = [NSMutableDictionary dictionary];
-        gOrigIVC = [NSMutableDictionary dictionary];
-
-        // 用 sel_registerName 避免编译器报"未声明的 selector"
-        HDHookSelector(sel_registerName("adjustSizeToStandardForMoments"),
-                       (IMP)HD_adjustSizeToStandardForMoments, gOrigAdj);
-        HDHookSelector(sel_registerName("shouldCompressLongImage"),
-                       (IMP)HD_shouldCompressLongImage, gOrigSCL);
-        HDHookSelector(sel_registerName("setSkipVideoCompress:"),
-                       (IMP)HD_setSkipVideoCompress, gOrigSVC);
-        HDHookSelector(sel_registerName("isVideoShouldExportWithoutCompressByAsset:scene:"),
-                       (IMP)HD_isVideoShouldExportWithoutCompress, gOrigIVC);
-
-        NSLog(@"[HDMoments] loaded, enabled=%d", HDOn());
-    }
+    NSLog(@"[MomentHD] 已加载 — WeChat 8.0.70 | RootHide/Relaxin Rootless");
 }

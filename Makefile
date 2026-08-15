@@ -1,17 +1,22 @@
-TARGET := iphone:clang:latest:15.0
-INSTALL_TARGET_PROCESSES = WeChat
+# ==========================================
+#  MomentHD — 高清朋友圈 (RootHide/Relaxin Rootless)
+#  适配 WeChat 8.0.70
+# ==========================================
 
-ARCHS = arm64
+TARGET := iphone:clang:17.0:15.0
 THEOS_PACKAGE_SCHEME = rootless
-DISABLE_ROOTLESS_COMPAT_WARNING = 1
+
+ARCHS = arm64e
+
+# 只注入微信进程，禁止全局注入
+INSTALL_TARGET_PROCESSES = WeChat
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = HDMoments
+TWEAK_NAME = MomentHD
 
-HDMoments_FILES = Tweak.x
-HDMoments_CFLAGS = -fobjc-arc -Wno-unused-variable -Wno-unused-function
-HDMoments_FRAMEWORKS = UIKit Foundation
-HDMoments_PRIVATE_FRAMEWORKS = 
+MomentHD_FILES = Tweak.x
+MomentHD_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function
+MomentHD_FRAMEWORKS = UIKit Foundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
