@@ -1,0 +1,60 @@
+name: Build MomentHD (Rootless)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  THEOS_PACKAGE_SCHEME: rootless
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Checkout Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          ref: master
+          submodules: recursive
+          path: theos
+
+      - name: Checkout iPhoneOS 16.5 SDK
+        uses: actions/checkout@v4
+        with:
+          repository: theos/sdks
+          sparse-checkout: iPhoneOS16.5.sdk
+          path: theos/sdks
+
+      - name: Create iPhoneOS17.0.sdk symlink
+        run: |
+          cd theos/sdks
+          ln -s iPhoneOS16.5.sdk iPhoneOS17.0.sdk
+          ls -la iPhoneOS17.0.sdk
+
+      - name: Install dependencies
+        run: brew install make xz ldid
+
+      - name: Build Rootless Package
+        run: |
+          export THEOS="$(pwd)/theos"
+          gmake clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+
+      - name: Verify rootless install path
+        run: |
+          echo "=== Checking .deb contents for /var/jb path ==="
+          for deb in packages/*.deb; do
+            echo "--- $deb ---"
+            dpkg-deb -c "$deb" | grep "var/jb" || echo "WARNING: /var/jb not found!"
+          done
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MomentHD-rootless
+          path: packages/*.deb

@@ -1,0 +1,9 @@
+Package: com.momenthd.tweak
+Name: MomentHD
+Version: 2.0.0
+Architecture: iphoneos-arm64
+Description: 高清朋友圈图片/视频 — 适配微信 8.0.70 (RootHide/Relaxin Rootless)
+Maintainer: MomentHD
+Author: MomentHD
+Section: Tweaks
+Depends: mobilesubstrate
