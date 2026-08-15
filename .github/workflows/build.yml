@@ -1,60 +1,57 @@
-name: Build MomentHD (Rootless)
+name: Build HD Moments Tweak
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:
-
-env:
-  THEOS_PACKAGE_SCHEME: rootless
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # 手动触发
 
 jobs:
   build:
     runs-on: macos-latest
-
     steps:
-      - name: Checkout project
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Checkout Theos
-        uses: actions/checkout@v4
-        with:
-          repository: theos/theos
-          ref: master
-          submodules: recursive
-          path: theos
-
-      - name: Checkout iPhoneOS 16.5 SDK
-        uses: actions/checkout@v4
-        with:
-          repository: theos/sdks
-          sparse-checkout: iPhoneOS16.5.sdk
-          path: theos/sdks
-
-      - name: Create iPhoneOS17.0.sdk symlink
+      - name: Install Theos
         run: |
-          cd theos/sdks
-          ln -s iPhoneOS16.5.sdk iPhoneOS17.0.sdk
-          ls -la iPhoneOS17.0.sdk
+          brew install ldid make
+          sudo mkdir -p /opt/theos
+          sudo chown -R $(whoami) /opt/theos
+          git clone --recursive https://github.com/theos/theos.git /opt/theos
 
-      - name: Install dependencies
-        run: brew install make xz ldid
-
-      - name: Build Rootless Package
+      - name: Set SDK
         run: |
-          export THEOS="$(pwd)/theos"
-          gmake clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          # 找到 Xcode 自带的 iPhoneOS SDK
+          SDK_DIR=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK_DIR"
+          # Theos 使用 Xcode 自带 SDK,无需额外下载
+          # 设置 Theos 环境变量
+          echo "THEOS=/opt/theos" >> $GITHUB_ENV
 
-      - name: Verify rootless install path
+      - name: Build
         run: |
-          echo "=== Checking .deb contents for /var/jb path ==="
-          for deb in packages/*.deb; do
-            echo "--- $deb ---"
-            dpkg-deb -c "$deb" | grep "var/jb" || echo "WARNING: /var/jb not found!"
-          done
+          make clean || true
+          make package FINALPACKAGE=1 \
+            THEOS_PACKAGE_SCHEME=rootless \
+            DISABLE_ROOTLESS_COMPAT_WARNING=1
 
-      - name: Upload .deb artifact
+      - name: Verify deb
+        run: |
+          echo "=== Built packages ==="
+          ls -lh packages/*.deb
+          echo "=== Verify ==="
+          DEB=$(ls packages/*.deb | head -1)
+          ar t "$DEB"
+          echo "--- control ---"
+          ar p "$DEB" control.tar.gz | tar xz -O ./control || ar p "$DEB" control.tar.gz | tar xz -O control/control
+          echo "--- data ---"
+          ar p "$DEB" data.tar.* | tar t -
+
+      - name: Upload deb
         uses: actions/upload-artifact@v4
         with:
-          name: MomentHD-rootless
+          name: hd-moments-deb
           path: packages/*.deb
+          retention-days: 30
